@@ -189,7 +189,9 @@ def get_portfolio():
 
 def get_groupnavs(group_name="IPO"):
     navs = read_navs(group_name=group_name)
-    return navs['Value'].astype('float').sum()
+    sum_nav = navs['Value'].astype('float').sum()
+    module_logger.debug(f'Sum of navs = {sum_nav}')
+    return sum_nav
 
 
 def get_db():
@@ -317,6 +319,173 @@ def place_order(client_id=123, ticker='SPY', sAction='SELL', iTotalQuantity=1000
 
     return result
 
+def buy_order(client_id=123, ticker='SPY', sAction='BUY'):
+    from ibapi.client import EClient
+    from ibapi.wrapper import EWrapper
+    from ibapi.contract import Contract
+    from ibapi.order import Order
+
+    import threading
+    import time
+    import datetime
+
+    class ib_class(EWrapper, EClient):
+        def __init__(self):
+            EClient.__init__(self, self)
+            self.nextorderId = None
+            self.contract_details = {}  # Contract details will be stored here using reqId as a dictionary key
+
+        def nextValidId(self, orderId: int):
+            super().nextValidId(orderId)
+            self.nextorderId = orderId
+            module_logger.info(f'The next valid order id is: {self.nextorderId}')
+
+        def orderStatus(self, orderId, status, filled, remaining, avgFullPrice, permId, parentId, lastFillPrice,
+                        clientId, whyHeld, mktCapPrice):
+            module_logger.info(
+                f'orderStatus - orderid: {orderId} status: {status} filled: {filled} remaining: {remaining} lastFillPrice: {lastFillPrice}')
+
+        def openOrder(self, orderId, contract, order, orderState):
+            module_logger.info(
+                f'openOrder id: {orderId} {contract.symbol} {contract.secType}  @ {contract.exchange} : {order.action} {order.orderType} {order.totalQuantity} {orderState.status}')
+
+        def execDetails(self, reqId, contract, execution):
+            module_logger.info(
+                f'Order Executed: {reqId} {contract.symbol} {contract.secType} {contract.currency} {execution.execId}  {execution.orderId} {execution.shares} {execution.lastLiquidity}')
+
+        def error(self, reqId, errorCode, errorString):
+            if errorCode == 202:
+                module_logger.error('order canceled')
+
+        def contractDetails(self, reqId: int, contractDetails):
+            self.contract_details[reqId] = contractDetails
+
+        def get_contract_details(self, reqId, contract):
+            self.contract_details[reqId] = None
+            self.reqContractDetails(reqId, contract)
+            # Error checking loop - breaks from loop once contract details are obtained
+            for i in range(50):
+                if not self.contract_details[reqId]:
+                    time.sleep(0.1)
+                else:
+                    break
+            # Raise if error checking loop count maxed out (contract details not obtained)
+            if i == 49:
+                raise Exception('error getting contract details')
+            # Return contract details otherwise
+            return app.contract_details[reqId].contract
+
+        def tickPrice(self, reqId, tickType, price, attrib):
+            if tickType == TickPrice.LastPrice:
+                module_logger.info(f'The current ask price for request_id = {reqId} is: {price}')
+
+                # TODO: получить из TWS
+                first_price = price     # первая цена
+                max_price = price       # максимальная цена
+                time_to_cond2 = datetime.datetime.now()
+
+
+    def stock_contract(symbol, secType='STK', exchange='SMART', currency='USD'):
+        contract = Contract()
+        contract.symbol = symbol
+        contract.secType = secType
+        contract.exchange = exchange
+        contract.currency = currency
+        return contract
+
+    def create_order(sAction, iTotalQuantity, sOrderType, sLmtPrice):
+        order = Order()
+        order.action = sAction
+        order.totalQuantity = iTotalQuantity
+        order.orderType = sOrderType
+        order.lmtPrice = sLmtPrice
+        return order
+
+    def create_order_pct(sAction="SELL", iPercent="-100", sOrderType="MKT", iTotalQuantity=0.0, bTransmit=True):
+        order = Order()
+        order.action = sAction
+        order.faGroup = GROUP_NAME
+        order.faMethod = "PctChange"
+        order.faPercentage = iPercent
+        order.orderType = sOrderType
+        order.totalQuantity = iTotalQuantity
+        order.transmit = bTransmit
+        return order
+
+    def run_loop():
+        app.run()
+
+    result = None
+    app = ib_class()
+    app.connect(IP_ADDRESS, IP_PORT, client_id)
+
+    app.nextorderId = None
+
+    # Start the socket in a thread
+    api_thread = threading.Thread(target=run_loop, daemon=True)
+    api_thread.start()
+
+    # Check if the API is connected via orderid
+    while True:
+        if isinstance(app.nextorderId, int):
+            module_logger.debug('API connected')
+            break
+        else:
+            module_logger.debug('waiting for connection')
+            time.sleep(1)
+
+    ticker_row = get_ticker_by_name(ticker)
+
+    if ticker_row is not None:
+        try:
+            group_nav = get_groupnavs(GROUP_NAME)
+        except Exception as e:
+            module_logger.error(f'Error getting groupnav for {GROUP_NAME}: {e}')
+
+        iLmtPrice = int(ticker_row['book_price']) * 2
+        iTotalQuantity = int(round(group_nav * ticker_row['allocation'] * ticker_row['v1_buy_alloc'] / iLmtPrice, 0))
+        order = create_order(
+            sAction,
+            iTotalQuantity=iTotalQuantity,
+            sOrderType='LMT',
+            sLmtPrice=iLmtPrice
+        )
+        order.tif = 'DAY'
+        order.faGroup = GROUP_NAME
+        order.faMethod = "NetLiq"
+        order.outsideRth = True
+
+        module_logger.info(f'Buy order for {ticker} totalQuantity={iTotalQuantity} LmtPrice={iLmtPrice}')
+        contract = stock_contract(ticker, currency=ticker_row['currency'])
+        app.placeOrder(app.nextorderId, contract, order)
+        app.nextorderId += 1
+
+        ## Price handling
+        # Create contract object
+        contract = Contract()
+        contract.symbol = ticker
+        contract.secType = 'STK'
+        contract.exchange = 'SMART'
+        contract.currency = 'USD'
+        contract = app.get_contract_details(ticker_row['request_id'], contract)
+
+        # Request Market Data
+        req_id = ticker_row['request_id']
+        if not req_id is None:
+            app.reqMktData(req_id, contract, '', False, False, [])
+            #
+        else:
+            module_logger.error('error request market data')
+        result = True
+
+    else:  # error
+        module_logger.error(f'Ticker was not found by name {ticker}')
+
+    time.sleep(3)
+    # app.disconnect()
+
+    return result
+
 def create_condition(client_id=123, ticker_name='SPY'):
     from ibapi.client import EClient
     from ibapi.wrapper import EWrapper
@@ -331,12 +500,21 @@ def create_condition(client_id=123, ticker_name='SPY'):
     class IBapi(EWrapper, EClient):
         def __init__(self):
             EClient.__init__(self, self)
+            self.nextorderId = None
             self.contract_details = {}  # Contract details will be stored here using reqId as a dictionary key
 
-        def nextValidId(self, orderId: int):
-            super().nextValidId(orderId)
-            self.nextorderId = orderId
-            print('The next valid order id is: ', self.nextorderId)
+        def nextValidId(self, iOrderId=None):
+            lock = threading.Lock()
+            lock.acquire()
+            try:
+                if iOrderId is None:
+                    iOrderId = self.nextorderId
+                super().nextValidId(iOrderId)
+                self.nextorderId = iOrderId
+                module_logger.debug(f"The next valid order id is: {self.nextorderId}")
+            finally:
+                lock.release()
+            return iOrderId
 
         def orderStatus(self, orderId, status, filled, remaining, avgFullPrice, permId, parentId, lastFillPrice,
                         clientId, whyHeld, mktCapPrice):
@@ -380,6 +558,16 @@ def create_condition(client_id=123, ticker_name='SPY'):
         contract.exchange = exchange
         contract.currency = currency
         return contract
+
+    def create_order(sAction, iTotalQuantity, sOrderType, sLmtPrice):
+        order = Order()
+        order.action = sAction
+        order.totalQuantity = iTotalQuantity
+        order.orderType = sOrderType
+        order.lmtPrice = sLmtPrice
+        order.faGroup = GROUP_NAME
+        order.faMethod = "NetLiq"
+        return order
 
     def create_order_pct(sAction="SELL", iPercent="-100", sOrderType="MKT", iTotalQuantity=0.0, bTransmit=True, sTif='DAY', sPriority="Normal"):
         order = Order()
@@ -436,25 +624,35 @@ def create_condition(client_id=123, ticker_name='SPY'):
 
             ##Create price condition for UP
             # init
-            priceCondition = Create(OrderCondition.Price)
-            priceCondition.conId = contract.conId
-            priceCondition.exchange = contract.exchange
+            totalQuantity = int(round(tws_row['Quantity'] * ticker_row[f'v_trig_up{cond_num}'], 0))
+            lmtPrice = round(tws_row['AverageCost'] * (1 + ticker_row[f'trigger_profit_up{cond_num}']), 2)
+            priceCondition = create_order(sAction='SELL', iTotalQuantity=totalQuantity, sOrderType='LMT', sLmtPrice=lmtPrice)
+            priceCondition.outsideRth = True
 
             # create conditions sell
+            '''
             priceCondition.isMore = True
             priceCondition.triggerMethod = priceCondition.TriggerMethodEnum.Last
             priceCondition.price = tws_row['AverageCost'] * (1 + ticker_row[f'trigger_profit_up{cond_num}'])
             percent = -100 * float(ticker_row[f'v_trig_up{cond_num}'])
-
+            
             module_logger.info(f"Calculated UP condition price {priceCondition.price}, persent = {percent} for {ticker_name}")
+            '''
 
             # Create order object
-            order = create_order_pct(sAction="SELL", iPercent=percent, sOrderType="MKT", bTransmit=True)
-            order.conditions.append(priceCondition)
+            # order = create_order_pct(sAction="SELL", iPercent=percent, sOrderType="MKT", bTransmit=True)
+            # order.conditions.append(priceCondition)
 
-            app.placeOrder(app.nextorderId+(cond_num-1)*2, contract, order)
+            # app.placeOrder(app.nextorderId+(cond_num-1)*2, contract, priceCondition)
+
+            module_logger.info(f"Calculated UP order totalQuantity={totalQuantity}, lmtPrice = {lmtPrice} for {ticker_name}")
+
+            app.placeOrder(app.nextorderId, contract, priceCondition)
+            app.nextorderId += 1
             module_logger.info(f"Condition{cond_num} UP placed for ticker {ticker_name}")
 
+
+            '''
             ##Create price condition for DOWN
             # init
             priceCondition = Create(OrderCondition.Price)
@@ -470,11 +668,15 @@ def create_condition(client_id=123, ticker_name='SPY'):
             module_logger.info(f"Calculated DOWN condition price {priceCondition.price}, persent = {percent} for {ticker_name}")
 
             # Create order object
-            order = create_order_pct(sAction="SELL", iPercent=percent, sOrderType="MKT", bTransmit=True)
+            order = create_order_pct(sAction="SELL", iPercent=percent, sOrderType="STP", bTransmit=True)
+            order.auxPrice = round(tws_row['AverageCost'] * (1 + ticker_row[f'stop_price{cond_num}']), 2)
             order.conditions.append(priceCondition)
 
-            app.placeOrder(app.nextorderId+(cond_num-1)*2+1, contract, order)
+            app.placeOrder(app.nextorderId, contract, order)
+            app.nextorderId += 1
             module_logger.info(f"Condition{cond_num} DOWN placed for ticker {ticker_name}")
+            '''
+
         break
 
     time.sleep(3)
@@ -639,7 +841,8 @@ def main():
     # print(tws_data.loc['SPY'])
     # print(d.iloc[0])
 
-    create_condition()
+    # create_condition()
+    buy_order()
 
     '''
     # 1.1 Для всех из портфеля повесить обработчик
