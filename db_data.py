@@ -17,14 +17,18 @@ class DBData:
         self.data = pd.read_csv(path, sep=';', header=0).set_index(index)
         self.__csv_path__ = path
         self.data['first_price_time'] = pd.to_datetime(self.data['first_price_time'])
-        log(f'Load from csv, {self.data.nrows} rows')
+        log(f'Load from csv, {len(self.data.index)} rows', 'INFO')
 
     def csv_save(self):
-        # TODO Save to CSV
-        pass
+        self.data.to_csv(self.__csv_path__, index=True, header=True, sep=';')
+        log(f'Save to csv, {len(self.data.index)} rows', 'INFO')
 
     def sql_load(self):
-        # TODO SQL
+        # TODO SQL LOAD
+        pass
+
+    def sql_save(self):
+        # TODO SQL SAVE
         pass
 
 

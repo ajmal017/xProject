@@ -23,9 +23,9 @@ __dbdata__ = DBData()
 
 
 class TickPrice(Enum):
-  BID = 1
-  ASK = 2
-  LAST = 4
+    BID = 1
+    ASK = 2
+    LAST = 4
 
 
 def stock_contract(symbol, sec_type='STK', exchange='SMART', currency='USD'):
@@ -37,32 +37,32 @@ def stock_contract(symbol, sec_type='STK', exchange='SMART', currency='USD'):
     return contract
 
 
-def create_order(action, total_quantity, method):
+def create_order(action, total_quantity, method, group_name):
     order = Order()
     order.action = action
     order.totalQuantity = total_quantity
-    order.faGroup = __config__['account']['group_name']
+    order.faGroup = group_name
     order.faMethod = method
+    order.transmit = True
     return order
 
 
-def create_order_buy(total_quantity):
-    order = create_order('BUY', total_quantity, "NetLiq")
+def create_order_buy(total_quantity, group_name):
+    order = create_order('BUY', total_quantity, "NetLiq", group_name)
     order.tif = 'DAY'
     order.outsideRth = True
     return order
 
 
-def create_order_lmt(action, total_quantity, method, order_type, lmt_price):
-    order = create_order(action, total_quantity, method)
-    order.orderType = order_type
+def create_order_lmt(action, total_quantity, method, lmt_price, group_name):
+    order = create_order(action, total_quantity, method, group_name)
+    order.orderType = "LMT"
     order.lmtPrice = lmt_price
     return order
 
 
-def create_order_pct(action="SELL", total_quantity=0, percent="-100", tif='DAY', transmit=True):
-    order = create_order(action, total_quantity, "PctChange")
-    order.transmit = transmit
+def create_order_pct(action="SELL", total_quantity=0, percent="-100", tif='DAY', group_name="IPO"):
+    order = create_order(action, total_quantity, "PctChange", group_name)
     order.orderType = "MKT"
     order.faPercentage = percent
     order.totalQuantity = total_quantity
@@ -70,10 +70,24 @@ def create_order_pct(action="SELL", total_quantity=0, percent="-100", tif='DAY',
     return make_adaptive(order)
 
 
-def make_adaptive(order):
+def make_adaptive(order, priority="Normal"):
     order.algoStrategy = "Adaptive"
-    order.algoParams = [TagValue("adaptivePriority", "Normal")]
+    order.algoParams = [TagValue("adaptivePriority", priority)]
     return order
+
+
+def place_order(ib_app, ticker, action, total_quantity, order_type, limit_price):
+    order = None
+    ticker_data = __dbdata__.ticker(ticker)
+
+    if order_type == "MKT":
+        order = make_adaptive(create_order(action, total_quantity, 'NetLiq', ticker_data['group_name']))
+        order.orderType = order_type
+
+    contract = stock_contract(ticker, currency=ticker_data['currency'])
+    contract = ib_app.get_contract_details(ticker_data['request_id'], contract)
+
+    ib_app.placeOrder(ib_app.nextValidId(), contract, order)
 
 
 class IBApp(EWrapper, EClient):
@@ -90,7 +104,7 @@ class IBApp(EWrapper, EClient):
         # connect to TWS and launch client thread
         self.connect(ip_address, ip_port, id_client)
         log(f"connection to {ip_address}:{ip_port} client = {id_client}", "INFO")
-        self.thread = Thread(target=self.run)
+        self.thread = Thread(target=self.run, daemon=True)
         self.thread.start()
 
         # Check if the API is connected via next_order_id
@@ -216,8 +230,8 @@ class IBApp(EWrapper, EClient):
 def start():
     app = IBApp(
         ip_address=__config__['connect']['ip_address'],
-        ip_port=__config__['connect']['ip_port'],
-        id_client=__config__['connect']['id_client']
+        ip_port=int(__config__['connect']['ip_port']),
+        id_client=int(__config__['connect']['id_client'])
     )
 
     log(f"Handle for account summary")
@@ -251,6 +265,24 @@ def init():
     )
 
 
-if __name__ == '__main__':
+def main():
     init()
-    start()
+    app = start()
+
+    # ib_app, action, total_quantity, order_type, limit_price, group_name, currency
+    place_order(
+        ib_app=app,
+        action='BUY',
+        total_quantity=1000,
+        order_type='MKT',
+        limit_price=0,
+        ticker="SPY"
+    )
+    while False:
+        pass # do something
+
+    stop(app)
+
+
+if __name__ == '__main__':
+    main()

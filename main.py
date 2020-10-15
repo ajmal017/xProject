@@ -924,6 +924,11 @@ def main():
         """
     '''
 
+import bot
+
 if __name__ == '__main__':
-    set_logger('w')
-    main()
+    # set_logger('w')
+    # main()
+    bot.main()
+
+
