@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 import logging
 
 module_logger = logging.getLogger('xProject')
@@ -135,12 +136,12 @@ def read_positions(client_id=10, time_sleep=3.0):  # read all accounts positions
     return current_positions
 
 
-def read_navs(client_id=10, time_sleep=3.0, group_name="IPO"):  # read all accounts NAVs
+def read_navs(client_id=10, time_sleep=1.0, group_name="IPO"):  # read all accounts NAVs
 
     from ibapi.client import EClient
     from ibapi.wrapper import EWrapper
     from ibapi.common import TickerId
-    from threading import Thread
+    from threading import Thread, Lock
 
     import pandas as pd
     import time
@@ -150,6 +151,7 @@ def read_navs(client_id=10, time_sleep=3.0, group_name="IPO"):  # read all accou
         def __init__(self, addr, port, client_id):
             EClient.__init__(self, self)
 
+            self.lock = Lock()
             self.connect(addr, port, client_id)  # Connect to TWS
             thread = Thread(target=self.run)  # Launch the client thread
             thread.start()
@@ -164,12 +166,15 @@ def read_navs(client_id=10, time_sleep=3.0, group_name="IPO"):  # read all accou
             index = str(account)
             self.all_accounts.loc[index] = reqId, account, tag, value, currency
 
+        def accountSummaryEnd(self, reqId: int):
+            module_logger.debug(f"AccountSummaryEnd. ReqId: {reqId}")
+
     ib_api = ib_class(IP_ADDRESS, IP_PORT, client_id)
     ib_api.reqAccountSummary(0, group_name, "NetLiquidation")  # associated callback: accountSummary
     module_logger.info("Waiting for IB's API response for NAVs requests...")
-    time.sleep(time_sleep)
+    # ib_api.lock.acquire()
+    ib_api.accountSummaryEnd(0)
     current_nav = ib_api.all_accounts
-
     module_logger.debug("read_navs -> Disconnect")
     ib_api.disconnect()
 
@@ -187,16 +192,22 @@ def get_portfolio():
     tws_data = positions.groupby(['Symbol']).apply(agg_multipositions)
 
 
-def get_groupnavs(group_name="IPO"):
-    navs = read_navs(group_name=group_name)
+def get_groupnavs(client_id=10, group_name="IPO"):
+    try:
+        navs = read_navs(client_id=client_id, group_name=group_name)
+    except Exception as e:
+        module_logger.error(e)
+
     sum_nav = navs['Value'].astype('float').sum()
-    module_logger.debug(f'Sum of navs = {sum_nav}')
+    module_logger.debug(f'{client_id} Sum of navs {group_name} = {sum_nav}')
     return sum_nav
 
 
 def get_db():
     global db_data
     db_data = pd.read_csv("companies.csv", sep=';', header=0).set_index('ticker_name')
+    db_data['first_price_time'] = pd.to_datetime(db_data['first_price_time'])
+    # db_data.append(pd.Series(name='time_to_condition2', dtype='datetime64[ns]'), ignore_index=True)
 
 
 def get_list_for_buy():
@@ -324,6 +335,8 @@ def buy_order(client_id=123, ticker='SPY', sAction='BUY'):
     from ibapi.wrapper import EWrapper
     from ibapi.contract import Contract
     from ibapi.order import Order
+    from ibapi.tag_value import TagValue
+    from ibapi.execution import ExecutionFilter
 
     import threading
     import time
@@ -350,8 +363,32 @@ def buy_order(client_id=123, ticker='SPY', sAction='BUY'):
                 f'openOrder id: {orderId} {contract.symbol} {contract.secType}  @ {contract.exchange} : {order.action} {order.orderType} {order.totalQuantity} {orderState.status}')
 
         def execDetails(self, reqId, contract, execution):
+            super().execDetails(reqId, contract, execution)
             module_logger.info(
                 f'Order Executed: {reqId} {contract.symbol} {contract.secType} {contract.currency} {execution.execId}  {execution.orderId} {execution.shares} {execution.lastLiquidity}')
+            ticker = contract.symbol
+
+            if (db_data.loc[ticker, 'first_order_quantity'] == execution.cumQty
+                    and execution.orderId == db_data.loc[ticker, 'first_order_id']):
+                # place order for buy
+                iLmtPrice = db_data.loc[ticker, 'first_price']
+                group_nav = get_groupnavs(11, GROUP_NAME)
+                iTotalQuantity = int(round(group_nav * db_data.loc[ticker, 'allocation'] * db_data.loc[ticker, 'v1_buy_alloc'] / iLmtPrice, 0)) - execution.cumQty
+                order = create_order_for_buy(ticker, iTotalQuantity, iLmtPrice, 'MKT')
+                order.algoStrategy = "Adaptive"
+                order.algoParams = [TagValue("adaptivePriority", "Normal")]
+                order.outsideRth = False
+
+                module_logger.info(f'Buy order for {ticker} totalQuantity={iTotalQuantity} LmtPrice={iLmtPrice}')
+                contract = stock_contract(ticker, currency=db_data.loc[ticker, 'currency'])
+                app.placeOrder(app.nextorderId, contract, order)
+                app.nextorderId += 1
+
+
+        def execDetailsEnd(self, reqId: int):
+            super().execDetailsEnd(reqId)
+            group_nav = get_groupnavs(14, GROUP_NAME)
+            print(reqId)
 
         def error(self, reqId, errorCode, errorString):
             if errorCode == 202:
@@ -380,10 +417,40 @@ def buy_order(client_id=123, ticker='SPY', sAction='BUY'):
                 module_logger.info(f'The current ask price for request_id = {reqId} is: {price}')
 
                 # TODO: получить из TWS
-                first_price = price     # первая цена
-                max_price = price       # максимальная цена
-                time_to_cond2 = datetime.datetime.now()
+                for ticker_name, db_row in get_ticker_by_reqid(reqId).iterrows():
+                    break
 
+                try:
+                    tws_row = tws_data.loc[ticker_name]
+                except:
+                    return
+                module_logger.debug(f'Ticker name : {ticker_name}')
+
+                if db_row['first_price'] == 0:
+                    db_data.loc[ticker_name, 'max_price15'] = db_data.loc[ticker_name, 'first_price'] = price
+                    db_data.loc[ticker_name, 'first_price_time'] = datetime.datetime.now()
+
+                elif (datetime.datetime.now() <
+                        db_row['first_price_time'] +
+                        np.timedelta64(db_row['time_to_cond2'], 's') ):
+                    if db_row['max_price15'] < price:
+                        db_data.loc[ticker_name, 'max_price15'] = price
+
+                else:
+                    pass
+
+    def create_order_for_buy(sTicker, iTotalQuantity, iLmtPrice, sOrderType):
+        order = create_order(
+            sAction,
+            iTotalQuantity=iTotalQuantity,
+            sOrderType=sOrderType,
+            sLmtPrice=iLmtPrice
+        )
+        order.tif = 'DAY'
+        order.faGroup = GROUP_NAME
+        order.faMethod = "NetLiq"
+        order.outsideRth = True
+        return order
 
     def stock_contract(symbol, secType='STK', exchange='SMART', currency='USD'):
         contract = Contract()
@@ -434,31 +501,23 @@ def buy_order(client_id=123, ticker='SPY', sAction='BUY'):
             module_logger.debug('waiting for connection')
             time.sleep(1)
 
-    ticker_row = get_ticker_by_name(ticker)
 
-    if ticker_row is not None:
-        try:
-            group_nav = get_groupnavs(GROUP_NAME)
-        except Exception as e:
-            module_logger.error(f'Error getting groupnav for {GROUP_NAME}: {e}')
 
-        iLmtPrice = int(ticker_row['book_price']) * 2
-        iTotalQuantity = int(round(group_nav * ticker_row['allocation'] * ticker_row['v1_buy_alloc'] / iLmtPrice, 0))
-        order = create_order(
-            sAction,
-            iTotalQuantity=iTotalQuantity,
-            sOrderType='LMT',
-            sLmtPrice=iLmtPrice
-        )
-        order.tif = 'DAY'
-        order.faGroup = GROUP_NAME
-        order.faMethod = "NetLiq"
-        order.outsideRth = True
-
+    if ticker in db_data.index:
+        iLmtPrice = db_data.loc[ticker, 'book_price'] * 2
+        group_nav = get_groupnavs(12, GROUP_NAME)
+        iTotalQuantity = int(
+            round(group_nav *
+                  db_data.loc[ticker, 'allocation'] *
+                  db_data.loc[ticker, 'v1_buy_alloc'] / iLmtPrice, 0))
+        order = create_order_for_buy(ticker, iTotalQuantity, iLmtPrice, 'LMT')
         module_logger.info(f'Buy order for {ticker} totalQuantity={iTotalQuantity} LmtPrice={iLmtPrice}')
-        contract = stock_contract(ticker, currency=ticker_row['currency'])
-        app.placeOrder(app.nextorderId, contract, order)
+        contract = stock_contract(ticker, currency=db_data.loc[ticker, 'currency'])
         app.nextorderId += 1
+        db_data.loc[ticker, 'first_order_id'] = app.nextorderId - 1
+        db_data.loc[ticker, 'first_order_quantity'] = iTotalQuantity
+        app.placeOrder(app.nextorderId-1, contract, order)
+        # save app.nextorderId
 
         ## Price handling
         # Create contract object
@@ -467,10 +526,10 @@ def buy_order(client_id=123, ticker='SPY', sAction='BUY'):
         contract.secType = 'STK'
         contract.exchange = 'SMART'
         contract.currency = 'USD'
-        contract = app.get_contract_details(ticker_row['request_id'], contract)
+        req_id = db_data.loc[ticker, 'request_id']
+        contract = app.get_contract_details(req_id, contract)
 
         # Request Market Data
-        req_id = ticker_row['request_id']
         if not req_id is None:
             app.reqMktData(req_id, contract, '', False, False, [])
             #
@@ -480,7 +539,6 @@ def buy_order(client_id=123, ticker='SPY', sAction='BUY'):
 
     else:  # error
         module_logger.error(f'Ticker was not found by name {ticker}')
-
     time.sleep(3)
     # app.disconnect()
 
@@ -741,7 +799,7 @@ def check_risk(client_id=123, ticker='AAPL', sec_type='STK', exchange='SMART', c
                 delta_cost = initial_cost - current_cost
 
                 try:
-                    group_nav = get_groupnavs(GROUP_NAME)
+                    group_nav = get_groupnavs(13, GROUP_NAME)
                 except Exception as e:
                     module_logger.error(f'Error getting groupnav for {GROUP_NAME}: {e}')
 
@@ -837,6 +895,7 @@ def main():
 
     # 1. Получить портфель и БД
     get_db()
+    # print(db_data.info())
     get_portfolio()
     # print(tws_data.loc['SPY'])
     # print(d.iloc[0])
