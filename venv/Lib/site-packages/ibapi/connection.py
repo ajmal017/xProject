@@ -105,6 +105,10 @@ class Connection:
         except socket.timeout:
             logger.debug("socket timeout from recvMsg %s", sys.exc_info())
             buf = b""
+        except OSError:
+            logger.debug("socket broken, disconnecting")
+            self.disconnect()
+            buf = b""
         else:
             pass
 
