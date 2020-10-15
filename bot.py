@@ -117,14 +117,15 @@ class IBApp(EWrapper, EClient):
                 time.sleep(0.5)
 
     def error(self, req_id, code, message):
-        if req_id > -1:
-            log(f"Error. Id: {req_id}, code: {code}, message: {message}", "ERROR")
         if code == 202:
             log('Order canceled', 'ERROR')
+        elif req_id > -1:
+            log(f"Error. Id: {req_id}, code: {code}, message: {message}", "ERROR")
 
     def accountSummary(self, req_id, account, tag, value, currency):
         index = str(account)
         self.__acc_summary__.loc[index] = req_id, account, tag, value, currency
+        log(f"{req_id} {account} {value}")
 
     def positionMulti(self, req_id, account, model_code, contract, pos, avg_cost):
         super().positionMulti(req_id, account, model_code, contract, pos, avg_cost)
@@ -269,7 +270,7 @@ def main():
     init()
     app = start()
 
-    # ib_app, action, total_quantity, order_type, limit_price, group_name, currency
+    """
     place_order(
         ib_app=app,
         action='BUY',
@@ -278,7 +279,8 @@ def main():
         limit_price=0,
         ticker="SPY"
     )
-    while False:
+    """
+    while True:
         pass # do something
 
     stop(app)
