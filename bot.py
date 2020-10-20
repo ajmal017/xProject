@@ -11,8 +11,8 @@ from logger import set_logger, log
 from db_data import DBData
 # COMMON
 from threading import Thread, Lock
-from enum import Enum
 from configparser import ConfigParser
+from string import printable
 import pandas as pd
 import numpy as np
 import time
@@ -22,18 +22,23 @@ __config__ = ConfigParser()
 __dbdata__ = DBData()
 
 
-class TickPrice(Enum):
+class TickPrice():
     BID = 1
     ASK = 2
     LAST = 4
 
 
-def stock_contract(symbol, sec_type='STK', exchange='SMART', currency='USD'):
+class Stock:
+    Exchange = {'EN': 'SMART', 'HK': 'SEHK', 'JP': 'SMART'}
+    Money = {'EN': 'USD', 'HK': 'HKD', 'JP': 'JPY'}
+
+
+def stock_contract(symbol, sec_type='STK', stock='EN'):
     contract = Contract()
     contract.symbol = symbol
     contract.secType = sec_type
-    contract.exchange = exchange
-    contract.currency = currency
+    contract.exchange = Stock.Exchange[stock]
+    contract.currency = Stock.Money[stock]
     return contract
 
 
@@ -76,20 +81,6 @@ def make_adaptive(order, priority="Normal"):
     return order
 
 
-def place_order(ib_app, ticker, action, total_quantity, order_type, limit_price):
-    order = None
-    ticker_data = __dbdata__.ticker(ticker)
-
-    if order_type == "MKT":
-        order = make_adaptive(create_order(action, total_quantity, 'NetLiq', ticker_data['group_name']))
-        order.orderType = order_type
-
-    contract = stock_contract(ticker, currency=ticker_data['currency'])
-    contract = ib_app.get_contract_details(ticker_data['request_id'], contract)
-
-    ib_app.placeOrder(ib_app.nextValidId(), contract, order)
-
-
 class IBApp(EWrapper, EClient):
     def __init__(self, ip_address, ip_port, id_client):
         EClient.__init__(self, self)
@@ -97,8 +88,12 @@ class IBApp(EWrapper, EClient):
         self.is_connect = True
         self.__tws_data__ = pd.DataFrame([], columns=['Symbol', 'Quantity', 'Average Cost'])
         self.__acc_summary__ = pd.DataFrame([], columns=['reqId', 'Account', 'Tag', 'Value', 'Currency'])
+        self.__tws_data_agg__ = None
+        self.closed_tickers = {}
         self.next_order_id = None
         self.contract_details = {}
+        self.reqid_ticker = {}
+        self.ticker_reqid = {}
         self.lock = Lock()
 
         # connect to TWS and launch client thread
@@ -120,7 +115,8 @@ class IBApp(EWrapper, EClient):
         if code == 202:
             log('Order canceled', 'ERROR')
         elif req_id > -1:
-            log(f"Error. Id: {req_id}, code: {code}, message: {message}", "ERROR")
+            message = ''.join(filter(lambda x: x in set(printable), message))
+            log(f"Error. Id: {req_id}, code: {code} message: {message}", "ERROR")
 
     def accountSummary(self, req_id, account, tag, value, currency):
         index = str(account)
@@ -135,12 +131,60 @@ class IBApp(EWrapper, EClient):
         else:
             index = str(account) + str(contract.symbol)
             self.__tws_data__.loc[index] = contract.symbol, pos, avg_cost
+            self.__tws_data_agg__ = None
+
+    def check_risk(self, ticker):
+        ticker_row = __dbdata__.data.loc[ticker]
+        contract = stock_contract(ticker, stock=ticker_row['stock'])
+        contract = self.get_contract_details(ticker_row['request_id'], contract)
+        self.reqid_ticker[ticker_row['request_id']] = ticker
+        self.ticker_reqid[ticker] = ticker_row['request_id']
+        self.reqMktData(ticker_row['request_id'], contract, '', False, False, [])
 
     def tickPrice(self, req_id, tick_type, price, attrib):
         if tick_type == TickPrice.LAST:
-            log(f'The last price for request_id = {req_id} is: {price}')
-            # TODO processing price changing
-            pass
+
+            ticker = self.reqid_ticker[req_id]
+            log(f'The last price for {ticker} request_id = {req_id} is: {price}')
+            tws_data = self.get_tws_data()
+
+            tws_row = tws_data.loc[ticker]
+            initial_cost = tws_row['Quantity'] * tws_row['AverageCost']
+            current_cost = tws_row['Quantity'] * price
+            delta_cost = current_cost - initial_cost
+
+            db_row = __dbdata__.data.loc[ticker]
+            group_nav = self.navs()
+            risk_value = group_nav * float(db_row['risk_check'])
+            log(f'For ticker {ticker} calculated delta_cost: {delta_cost}, risk_value: {risk_value}')
+
+            self.lock.acquire()
+            try:
+                if ticker not in self.closed_tickers and (delta_cost > -1. * risk_value) and (tws_row['Quantity'] > 0):
+                    order = make_adaptive(create_order_pct(group_name=db_row['group_name']))
+                    order.orderType = "MKT"
+                    self.closed_tickers[ticker] = self.place_order(ticker=ticker, order=order, stock=db_row['stock'])
+                    log(f'Place order for close ticker {ticker}')
+            finally:
+                log(f'Released a lock {ticker}')
+                self.lock.release()
+
+    def place_order(self, ticker, order, stock):
+        contract = stock_contract(ticker, stock=stock)
+        """
+        req_id = self.next_order_id
+        self.next_order_id += 1
+        try:
+            contract = self.get_contract_details(req_id, contract)
+        except Exception as e:
+            print(contract)
+            log(f'message: {e} contract: {contract}')
+        """
+        # order_id = ib_app.nextValidId() # TODO Check nextValidID
+        order_id = self.next_order_id
+        self.next_order_id += 1
+        self.placeOrder(order_id, contract, order)
+        return order_id
 
     def orderStatus(self, orderId, status, filled, remaining, avgFullPrice, permId, parentId, lastFillPrice, clientId, whyHeld, mktCapPrice):
         log(f'orderStatus - orderid: {orderId} status: {status} filled: {filled} remaining: {remaining} lastFillPrice: {lastFillPrice}')
@@ -153,6 +197,7 @@ class IBApp(EWrapper, EClient):
         log(f'Order Executed: {reqId} {contract.symbol} {contract.secType} {contract.currency} {execution.execId}  {execution.orderId} {execution.shares} {execution.lastLiquidity}')
         ticker = contract.symbol
 
+        """
         if (__dbdata__.data.loc[ticker, 'first_order_quantity'] == execution.cumQty
                 and execution.orderId == __dbdata__.data.loc[ticker, 'first_order_id']):
             # place order for buy if first order is filled
@@ -170,15 +215,15 @@ class IBApp(EWrapper, EClient):
                     action='BUY',
                     total_quantity=total_quantity,
                     method="NetLiq",
-                    order_type='MKT',
                     lmt_price=limit_price)
             )
             order.outsideRth = False
 
             log(f'Buy order for {ticker} totalQuantity={total_quantity} LmtPrice={limit_price}')
-            contract = stock_contract(symbol=ticker, currency=__dbdata__.data.loc[ticker, 'currency'])
+            contract = stock_contract(symbol=ticker, stock=__dbdata__.data.loc[ticker, 'stock'])
             self.placeOrder(self.next_order_id, contract, order)
             self.next_order_id += 1
+        """
 
     def nextValidId(self, order_id=None):
         lock = Lock()
@@ -207,19 +252,23 @@ class IBApp(EWrapper, EClient):
                 break
         # Raise if error checking loop count maxed out (contract details not obtained)
         if i == 49:
-            log('error getting contract details', 'ERROR')
+            log(f'error getting contract details {req_id}', 'ERROR')
+        else:
+            self.contract_details[req_id].contract = contract
         # Return contract details otherwise
         return self.contract_details[req_id].contract
 
-    def tws_data(self):
-        data = self.__tws_data__
-        data.set_index('Symbol', inplace=True, drop=True)
+    def get_tws_data(self):
 
         def agg_positions(row):
             d = {'Quantity': row['Quantity'].sum(), 'AverageCost': row['Average Cost'].mean()}
             return pd.Series(d, index=['Quantity', 'AverageCost'])
 
-        return data.groupby(['Symbol']).apply(agg_positions)
+        if self.__tws_data_agg__ is None:
+            self.__tws_data_agg__ = self.__tws_data__.copy(deep=True)
+            self.__tws_data_agg__.set_index('Symbol', inplace=True, drop=True)
+
+        return self.__tws_data_agg__.groupby(['Symbol']).apply(agg_positions)
 
     def navs(self):
         data = self.__acc_summary__
@@ -245,6 +294,17 @@ def start():
     return app
 
 
+def save_csv():
+    __dbdata__.csv_save()
+
+
+def load_csv():
+    __dbdata__.csv_load(
+        path=__config__['db_csv']['path'],
+        index=__config__['db_csv']['index']
+    )
+
+
 def stop(app):
     try:
         app.disconnect()
@@ -260,16 +320,12 @@ def init():
         mode=__config__['logger']['mode'],
         level=__config__['logger']['level']
     )
-    __dbdata__.csv_load(
-        path=__config__['db_csv']['path'],
-        index=__config__['db_csv']['index']
-    )
+    load_csv()
 
 
 def main():
     init()
     app = start()
-
     """
     place_order(
         ib_app=app,
@@ -280,9 +336,14 @@ def main():
         ticker="SPY"
     )
     """
-    while True:
-        pass # do something
 
+    tws_data = app.get_tws_data()
+    for ticker, row in tws_data.iterrows():
+        app.check_risk(ticker)
+
+
+    while True:
+        pass
     stop(app)
 
 

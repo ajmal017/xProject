@@ -1,3 +1,4 @@
+import bot
 import pandas as pd
 import numpy as np
 import logging
@@ -924,11 +925,7 @@ def main():
         """
     '''
 
-import bot
-
 if __name__ == '__main__':
+    bot.main()
     # set_logger('w')
     # main()
-    bot.main()
-
-
