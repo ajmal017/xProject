@@ -160,7 +160,7 @@ class IBApp(EWrapper, EClient):
 
             self.lock.acquire()
             try:
-                if ticker not in self.closed_tickers and (delta_cost > -1. * risk_value) and (tws_row['Quantity'] > 0):
+                if ticker not in self.closed_tickers and (delta_cost < -1. * risk_value) and (tws_row['Quantity'] > 0):
                     order = make_adaptive(create_order_pct(group_name=db_row['group_name']))
                     order.orderType = "MKT"
                     self.closed_tickers[ticker] = self.place_order(ticker=ticker, order=order, stock=db_row['stock'])
