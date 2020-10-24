@@ -13,16 +13,21 @@ from db_data import DBData
 from threading import Thread, Lock
 from configparser import ConfigParser
 from string import printable
+from copy import deepcopy
 import pandas as pd
 import numpy as np
 import time
+import datetime
+import queue
 
+
+# TODO comments
 
 __config__ = ConfigParser()
 __dbdata__ = DBData()
 
 
-class TickPrice():
+class TickPrice:
     BID = 1
     ASK = 2
     LAST = 4
@@ -31,6 +36,212 @@ class TickPrice():
 class Stock:
     Exchange = {'EN': 'SMART', 'HK': 'SEHK', 'JP': 'SMART'}
     Money = {'EN': 'USD', 'HK': 'HKD', 'JP': 'JPY'}
+
+
+## marker for when queue is finished
+FINISHED = object()
+STARTED = object()
+TIME_OUT = object()
+
+
+class FinishableQueue(object):
+    """
+    Creates a queue which will finish at some point
+    """
+
+    def __init__(self, queue_to_finish):
+        self._queue = queue_to_finish
+        self.status = STARTED
+
+    def get(self, timeout):
+        """
+        Returns a list of queue elements once timeout is finished, or a FINISHED flag is received in the queue
+
+        :param timeout: how long to wait before giving up
+        :return: list of queue elements
+        """
+        contents_of_queue = []
+        finished = False
+
+        while not finished:
+            try:
+                current_element = self._queue.get(timeout=timeout)
+                if current_element is FINISHED:
+                    finished = True
+                    self.status = FINISHED
+                else:
+                    contents_of_queue.append(current_element)
+                    ## keep going and try and get more data
+
+            except queue.Empty:
+                ## If we hit a time out it's most probable we're not getting a finished element any time soon
+                ## give up and return what we have
+                finished = True
+                self.status = TIME_OUT
+
+        return contents_of_queue
+
+    def timed_out(self):
+        return self.status is TIME_OUT
+
+
+## marker to show a mergable object hasn't got any attributes
+NO_ATTRIBUTES_SET=object()
+
+class mergableObject(object):
+    """
+    Generic object to make it easier to munge together incomplete information about orders and executions
+    """
+
+    def __init__(self, id, **kwargs):
+        """
+
+        :param id: master reference, has to be an immutable type
+        :param kwargs: other attributes which will appear in list returned by attributes() method
+        """
+
+        self.id=id
+        attr_to_use=self.attributes()
+
+        for argname in kwargs:
+            if argname in attr_to_use:
+                setattr(self, argname, kwargs[argname])
+            else:
+                print("Ignoring argument passed %s: is this the right kind of object? If so, add to .attributes() method" % argname)
+
+    def attributes(self):
+        ## should return a list of str here
+        ## eg return ["thingone", "thingtwo"]
+        return NO_ATTRIBUTES_SET
+
+    def _name(self):
+        return "Generic Mergable object - "
+
+    def __repr__(self):
+        attr_list = self.attributes()
+        if attr_list is NO_ATTRIBUTES_SET:
+            return self._name()
+
+        return self._name()+" ".join([ "%s: %s" % (attrname, str(getattr(self, attrname))) for attrname in attr_list
+                                                  if getattr(self, attrname, None) is not None])
+
+    def merge(self, details_to_merge, overwrite=True):
+        """
+        Merge two things
+
+        self.id must match
+
+        :param details_to_merge: thing to merge into current one
+        :param overwrite: if True then overwrite current values, otherwise keep current values
+        :return: merged thing
+        """
+
+        if self.id!=details_to_merge.id:
+            raise Exception("Can't merge details with different IDS %d and %d!" % (self.id, details_to_merge.id))
+
+        arg_list = self.attributes()
+        if arg_list is NO_ATTRIBUTES_SET:
+            ## self is a generic, empty, object.
+            ## I can just replace it wholesale with the new object
+
+            new_object = details_to_merge
+
+            return new_object
+
+        new_object = deepcopy(self)
+
+        for argname in arg_list:
+            my_arg_value = getattr(self, argname, None)
+            new_arg_value = getattr(details_to_merge, argname, None)
+
+            if new_arg_value is not None:
+                ## have something to merge
+                if my_arg_value is not None and not overwrite:
+                    ## conflict with current value, don't want to overwrite, skip
+                    pass
+                else:
+                    setattr(new_object, argname, new_arg_value)
+
+        return new_object
+
+
+class list_of_mergables(list):
+    """
+    A list of mergable objects, like execution details or order information
+    """
+    def merged_dict(self):
+        """
+        Merge and remove duplicates of a stack of mergable objects with unique ID
+
+        Essentially creates the union of the objects in the stack
+
+        :return: dict of mergableObjects, keynames .id
+        """
+
+        ## We create a new stack of order details which will contain merged order or execution details
+        new_stack_dict = {}
+
+        for stack_member in self:
+            id = stack_member.id
+
+            if id not in new_stack_dict.keys():
+                ## not in new stack yet, create a 'blank' object
+                ## Note this will have no attributes, so will be replaced when merged with a proper object
+                new_stack_dict[id] = mergableObject(id)
+
+            existing_stack_member = new_stack_dict[id]
+
+            ## add on the new information by merging
+            ## if this was an empty 'blank' object it will just be replaced with stack_member
+            new_stack_dict[id] = existing_stack_member.merge(stack_member)
+
+        return new_stack_dict
+
+
+    def blended_dict(self, stack_to_merge):
+        """
+        Merges any objects in new_stack with the same ID as those in the original_stack
+
+        :param self: list of mergableObject or inheritors thereof
+        :param stack_to_merge: list of mergableObject or inheritors thereof
+
+        :return: dict of mergableObjects, keynames .id
+        """
+
+        ## We create a new dict stack of order details which will contain merged details
+
+        new_stack = {}
+
+        ## convert the thing we're merging into a dictionary
+        stack_to_merge_dict = stack_to_merge.merged_dict()
+
+        for stack_member in self:
+            id = stack_member.id
+            new_stack[id] = deepcopy(stack_member)
+
+            if id in stack_to_merge_dict.keys():
+                ## add on the new information by merging without overwriting
+                new_stack[id] = stack_member.merge(stack_to_merge_dict[id], overwrite=False)
+
+        return new_stack
+
+
+class orderInformation(mergableObject):
+    """
+    Collect information about orders
+
+    master ID will be the orderID
+
+    eg you'd do order_details = orderInformation(orderID, contract=....)
+    """
+
+    def _name(self):
+        return "Order - "
+
+    def attributes(self):
+        return ['contract','order','orderstate','status',
+                 'filled', 'remaining', 'avgFillPrice', 'permid',
+                 'parentId', 'lastFillPrice', 'clientId', 'whyHeld']
 
 
 def stock_contract(symbol, sec_type='STK', stock='EN'):
@@ -59,10 +270,21 @@ def create_order_buy(total_quantity, group_name):
     return order
 
 
-def create_order_lmt(action, total_quantity, method, lmt_price, group_name):
-    order = create_order(action, total_quantity, method, group_name)
+def create_order_lmt(action, percent, lmt_price, group_name="IPO"):
+    order = create_order(action, 0, "PctChange", group_name)
     order.orderType = "LMT"
+    order.faPercentage = percent
     order.lmtPrice = lmt_price
+    order.tif = 'GTC'
+    return order
+
+
+def create_order_stp(action, percent, aux_price, group_name="IPO"):
+    order = create_order(action, 0, "PctChange", group_name)
+    order.orderType = "STP"
+    order.faPercentage = percent
+    order.auxPrice = aux_price
+    order.tif = 'GTC'
     return order
 
 
@@ -94,7 +316,9 @@ class IBApp(EWrapper, EClient):
         self.contract_details = {}
         self.reqid_ticker = {}
         self.ticker_reqid = {}
+        self._my_open_orders = queue.Queue()
         self.lock = Lock()
+        self.init_error()
 
         # connect to TWS and launch client thread
         self.connect(ip_address, ip_port, id_client)
@@ -111,12 +335,29 @@ class IBApp(EWrapper, EClient):
                 log('Waiting for connection...')
                 time.sleep(0.5)
 
+    def init_error(self):
+        error_queue = queue.Queue()
+        self._my_errors = error_queue
+
+    def get_error(self, timeout=5):
+        if self.is_error():
+            try:
+                return self._my_errors.get(timeout=timeout)
+            except queue.Empty:
+                return None
+        return None
+
+    def is_error(self):
+        an_error_if = not self._my_errors.empty()
+        return an_error_if
+
     def error(self, req_id, code, message):
         if code == 202:
             log('Order canceled', 'ERROR')
         elif req_id > -1:
             message = ''.join(filter(lambda x: x in set(printable), message))
             log(f"Error. Id: {req_id}, code: {code} message: {message}", "ERROR")
+            self._my_errors.put(message)
 
     def accountSummary(self, req_id, account, tag, value, currency):
         index = str(account)
@@ -141,9 +382,44 @@ class IBApp(EWrapper, EClient):
         self.ticker_reqid[ticker] = ticker_row['request_id']
         self.reqMktData(ticker_row['request_id'], contract, '', False, False, [])
 
-    def tickPrice(self, req_id, tick_type, price, attrib):
-        if tick_type == TickPrice.LAST:
+    def cancel_orders_for_ticker(self, ticker):
+        open_orders = self.get_open_orders()
+        for order_id in open_orders:
+            if open_orders[order_id].contract.symbol == ticker:
+                self.cancel_order(order_id)
 
+    def udpate_levels(self, ticker, avg_price: float, last_price):
+        # request all open orders for current client id
+        self.cancel_orders_for_ticker(ticker)
+
+        db_row = __dbdata__.data.loc[ticker]
+
+        # set new orders
+        # UP
+        for level in range(1, 5):
+            if db_row['level_is_active_%d' % level]:
+                lmt_price = round(avg_price * (1 + float(db_row['trigger_profit_up%d' % level])), 2)
+                up_order = create_order_lmt(
+                    action='SELL',
+                    percent=-100*db_row['v_trig_up%d' % level],
+                    lmt_price=lmt_price,
+                    group_name=db_row['group_name']
+                )
+                self.place_order(ticker=ticker, order=up_order, stock=db_row['stock'])
+        # DOWN
+        stop_price = round(avg_price * (1 - float(db_row['stop_price_start'])), 2)
+        up_order = create_order_stp(
+            action='SELL',
+            percent=-100,
+            aux_price=stop_price,
+            group_name=db_row['group_name']
+        )
+        self.place_order(ticker=ticker, order=up_order, stock=db_row['stock'])
+
+
+    def tickPrice(self, req_id, tick_type, price, attrib):
+        # TODO cancel orders for not active ticker
+        if tick_type == TickPrice.LAST:
             ticker = self.reqid_ticker[req_id]
             log(f'The last price for {ticker} request_id = {req_id} is: {price}')
             tws_data = self.get_tws_data()
@@ -158,17 +434,22 @@ class IBApp(EWrapper, EClient):
             risk_value = group_nav * float(db_row['risk_check'])
             log(f'For ticker {ticker} calculated delta_cost: {delta_cost}, risk_value: {risk_value}')
 
-            self.lock.acquire()
-            try:
-                if ticker not in self.closed_tickers and (delta_cost < -1. * risk_value) and (tws_row['Quantity'] > 0):
-                    order = make_adaptive(create_order_pct(group_name=db_row['group_name']))
-                    order.orderType = "MKT"
-                    self.closed_tickers[ticker] = self.place_order(ticker=ticker, order=order, stock=db_row['stock'])
-                    log(f'Place order for close ticker {ticker}')
-            finally:
-                log(f'Released a lock {ticker}')
-                self.lock.release()
+            # is risk exceed?
+            if delta_cost > -1. * risk_value:
+                self.lock.acquire()
+                try:
+                    if ticker not in self.closed_tickers and (tws_row['Quantity'] > 0):
+                        order = make_adaptive(create_order_pct(group_name=db_row['group_name']))
+                        order.orderType = "MKT"
+                        self.closed_tickers[ticker] = self.place_order(ticker=ticker, order=order, stock=db_row['stock'])
+                        log(f'Place order for close ticker {ticker}')
+                finally:
+                    log(f'Released a lock {ticker}')
+                    self.lock.release()
+            else:
+                self.udpate_levels(ticker, tws_row['AverageCost'], price)
 
+    # orders section
     def place_order(self, ticker, order, stock):
         contract = stock_contract(ticker, stock=stock)
         """
@@ -186,16 +467,92 @@ class IBApp(EWrapper, EClient):
         self.placeOrder(order_id, contract, order)
         return order_id
 
-    def orderStatus(self, orderId, status, filled, remaining, avgFullPrice, permId, parentId, lastFillPrice, clientId, whyHeld, mktCapPrice):
+    def get_open_orders(self):
+        """
+        Returns a list of any open orders
+        """
+        open_orders_queue = FinishableQueue(self.init_open_orders()) # store the orders somewhere
+        self.reqAllOpenOrders()
+        MAX_WAIT_SECONDS = 5 # Run until we get a terimination or get bored waiting
+        open_orders_list = list_of_mergables(open_orders_queue.get(timeout=MAX_WAIT_SECONDS))
+
+        while self.wrapper.is_error():
+            print(self.get_error())
+
+        if open_orders_queue.timed_out():
+            print("Exceeded maximum wait for wrapper to confirm finished whilst getting orders")
+        ## open orders queue will be a jumble of order details, turn into a tidy dict with no duplicates
+        open_orders_dict = open_orders_list.merged_dict()
+        return open_orders_dict
+
+    def init_open_orders(self):
+        open_orders_queue = self._my_open_orders = queue.Queue()
+        return open_orders_queue
+
+    def cancel_order(self, orderid):
+        ## Has to be an order placed by this client. I don't check this here -
+        ## If you have multiple IDs then you you need to check this yourself.
+        self.cancelOrder(orderid)
+        ## Wait until order is cancelled
+        start_time = datetime.datetime.now()
+        MAX_WAIT_TIME_SECONDS = 10
+        finished = False
+        while not finished:
+            if orderid not in self.get_open_orders():
+                ## finally cancelled
+                finished = True
+            if (datetime.datetime.now() - start_time).seconds > MAX_WAIT_TIME_SECONDS:
+                print("Wrapper didn't come back with confirmation that order was cancelled!")
+                finished = True
+        ## return nothing
+
+    def cancel_all_orders(self):
+        ## Cancels all orders, from all client ids.
+        ## if you don't want to do this, then instead run .cancel_order over named IDs
+        self.reqGlobalCancel()
+        start_time = datetime.datetime.now()
+        MAX_WAIT_TIME_SECONDS = 10
+        finished = False
+        while not finished:
+            if not self.any_open_orders():
+                ## all orders finally cancelled
+                finished = True
+            if (datetime.datetime.now() - start_time).seconds > MAX_WAIT_TIME_SECONDS:
+                print("Wrapper didn't come back with confirmation that all orders were cancelled!")
+                finished = True
+        ## return nothing
+
+    def any_open_orders(self):
+        """
+        Simple wrapper to tell us if we have any open orders
+        """
+        return len(self.get_open_orders()) > 0
+
+    def orderStatus(self, orderId, status: str, filled: float,
+                    remaining: float, avgFillPrice: float, permId: int,
+                    parentId: int, lastFillPrice: float, clientId: int,
+                    whyHeld: str, mktCapPrice: float):
         log(f'orderStatus - orderid: {orderId} status: {status} filled: {filled} remaining: {remaining} lastFillPrice: {lastFillPrice}')
+        order_details = orderInformation(orderId, status=status, filled=filled,
+                                         avgFillPrice=avgFillPrice, permid=permId,
+                                         parentId=parentId, lastFillPrice=lastFillPrice, clientId=clientId,
+                                         whyHeld=whyHeld)
+        self._my_open_orders.put(order_details)
 
     def openOrder(self, orderId, contract, order, orderState):
         log(f'openOrder id: {orderId} {contract.symbol} {contract.secType}  @ {contract.exchange} : {order.action} {order.orderType} {order.totalQuantity} {orderState.status}')
+        order_details = orderInformation(orderId, contract=contract, order=order, orderstate=orderState)
+        self._my_open_orders.put(order_details)
+
+    def openOrderEnd(self):
+        self._my_open_orders.put(FINISHED)
 
     def execDetails(self, reqId, contract, execution):
         super().execDetails(reqId, contract, execution)
         log(f'Order Executed: {reqId} {contract.symbol} {contract.secType} {contract.currency} {execution.execId}  {execution.orderId} {execution.shares} {execution.lastLiquidity}')
         ticker = contract.symbol
+
+        # TODO закрытый тикер установить is_active => false
 
         """
         if (__dbdata__.data.loc[ticker, 'first_order_quantity'] == execution.cumQty
@@ -341,8 +698,11 @@ def main():
     for ticker, row in tws_data.iterrows():
         app.check_risk(ticker)
 
+    tws_row = tws_data.loc[ticker]
+    app.udpate_levels('SPY', tws_row['AverageCost'], 0)
 
-    while True:
+    while False:
+        # time.sleep(5)
         pass
     stop(app)
 
