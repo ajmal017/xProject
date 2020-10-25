@@ -3,15 +3,28 @@ import pandas as pd
 
 
 class DBData:
+    """
+        Load data from external source (e.g. CSV, SQL)
+    """
     def __init__(self):
         self.data = None
         self.__csv_path__ = ""
+        self.is_changed = False
 
     def ticker(self, name):
         if self.data is not None and name in self.data.index:
             return self.data.loc[name]
         else:
             log(f'Error getting row by ticker name {name}', 'ERROR')
+
+    @property
+    def iterrows(self):
+        return self.data.iterrows
+
+    def set_value(self, ticker, field, value):
+        self.is_changed = True
+        self.data.at[ticker, field] = value
+        log(f'Change DB value {field} = {value} for {ticker}')
 
     def csv_load(self, path, index):
         self.data = pd.read_csv(path, sep=';', header=0).set_index(index)
