@@ -35,7 +35,7 @@ class SampleOrder:
         return order
 
     @staticmethod
-    def create_order_buy(total_quantity, lmt_price, group_name):
+    def create_order_buy(total_quantity, lmt_price=0, group_name="IPO"):
         order = SampleOrder.create_order('BUY', total_quantity, "NetLiq", group_name)
         order.tif = 'DAY'
         order.orderType = 'LMT'

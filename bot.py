@@ -6,13 +6,17 @@ from ibapiobject import IBAPIWrapper, IBAPIClient
 from scaffolding import TickPrice, FILL_CODE
 
 # COMMON
-
 from threading import Thread, Lock
 from configparser import ConfigParser
-
 import pandas as pd
 import time
 import datetime
+
+
+# TODO save last price for every position in DB
+# TODO create thread for every position and monitor last_price from DB
+# TODO run algorithm from thread if condition execute
+# TODO replace algorithm from execDetails and tickPrice to thread-method
 
 
 __config__ = ConfigParser()
@@ -43,13 +47,14 @@ class IBApp(IBAPIWrapper, IBAPIClient):
         self.closed_tickers = {}
         self.next_order_id = None
 
+        self.init_error()
+
         # Connect to TWS and launch client thread
         self.connect(ip_address, ip_port, id_client)
         log(f"connection to {ip_address}:{ip_port} client = {id_client}", "INFO")
         self.thread = Thread(target=self.run, daemon=True)
         self.thread.start()
         setattr(self, "_thread", self.thread)
-        self.init_error()
 
         # Check if the API is connected via next_order_id
         while not self.isConnected():
@@ -80,12 +85,13 @@ class IBApp(IBAPIWrapper, IBAPIClient):
         log(f'Calculate NAVS = {sum_nav}')
         return sum_nav
 
-    def buy_or_sell(self, ticker, total_quantity):
+    def buy_or_sell(self, ticker, total_quantity: int):
         """
             Buy (or sell) total quantity for ticker as MKT, adaptive strategy
         """
         db_row = __dbdata__.ticker(ticker)
 
+        total_quantity = int(total_quantity)
         order = SampleOrder.create_order_buy(
             total_quantity=total_quantity,
             group_name=db_row['group_name']
@@ -103,6 +109,7 @@ class IBApp(IBAPIWrapper, IBAPIClient):
             symbol=ticker,
             stock=db_row['stock']
         )
+        contract = self.resolve_ib_contract(contract)
 
         return self.place_order(contract, order)
 
@@ -187,6 +194,7 @@ class IBApp(IBAPIWrapper, IBAPIClient):
                     order.faMethod = "NetLiq"
                     order.totalQuantity = group_nav*db_row['allocation']*db_row['v3_buy_alloc']/price
                     contract = SampleOrder.stock_contract(ticker, stock=db_row['stock'])
+                    contract = self.resolve_ib_contract(contract)
                     order.orderRef = "STAGE3"
                     self.place_order(ibcontract=contract, order=order)
 
@@ -196,17 +204,18 @@ class IBApp(IBAPIWrapper, IBAPIClient):
             # check flags for triggers
             for level in range(4):
                 is_active_name = f'stop_is_active_{level}'
-                trigger_stop = f'trigger_stop_up_{level}'
-                if db_row[is_active_name] and price > tws_row['AverageCost'] * (1 + db_row[trigger_stop]):
+                trigger_stop = f'trigger_stop_up_{level+1}'
+                if db_row[is_active_name] and price > db_row['first_price'] * (1 + db_row[trigger_stop]):
                     __dbdata__.set_value(ticker, is_active_name, 0)
 
             # is risk exceed?
-            if delta_cost > -1. * risk_value:
+            if delta_cost > -1. * risk_value: # TODO correct comparasion -> delta_cost < -1. * risk_value
                 self.lock.acquire()
                 try:
-                    if ticker not in self.closed_tickers and (tws_row['Quantity'] > 0):
+                    if ticker not in self.closed_tickers:
                         order = SampleOrder.create_order_pct(group_name=db_row['group_name'])
                         contract = SampleOrder.stock_contract(ticker, stock=db_row['stock'])
+                        contract = self.resolve_ib_contract(contract)
                         self.closed_tickers[ticker] = self.place_order(contract, order)
                         log(f'Place order for close ticker {ticker}')
                 finally:
@@ -219,9 +228,10 @@ class IBApp(IBAPIWrapper, IBAPIClient):
         ticker_row = __dbdata__.ticker(ticker)
         contract = SampleOrder.stock_contract(ticker, stock=ticker_row['stock'])
         contract = self.resolve_ib_contract(contract)
-        self.reqid_ticker[ticker_row['request_id']] = ticker
-        self.ticker_reqid[ticker] = ticker_row['request_id']
-        self.reqMktData(ticker_row['request_id'], contract, '', False, False, [])
+        req_id = ticker_row['request_id']
+        self.reqid_ticker[req_id] = ticker
+        self.ticker_reqid[ticker] = req_id
+        self.reqMktData(req_id, contract, '', False, False, [])
 
     def initial_buy(self, ticker):
         db_row = __dbdata__.ticker(ticker)
@@ -254,6 +264,7 @@ class IBApp(IBAPIWrapper, IBAPIClient):
         # set new orders
         # UP
         contract = SampleOrder.stock_contract(ticker, stock=db_row['stock'])
+        contract = self.resolve_ib_contract(contract)
         for level in range(1, 5):
             if db_row['level_is_active_%d' % level]:
                 lmt_price = round(first_price * (1 + float(db_row['trigger_profit_up%d' % level])), 2)
@@ -267,7 +278,8 @@ class IBApp(IBAPIWrapper, IBAPIClient):
         # DOWN
         for level in range(5):
             if db_row[f'stop_is_active_{level}']:
-                stop_price = round(first_price * (1 + float(db_row[f'stop_price_{level}'])), 2)
+                stop_price = first_price * (1.0 + db_row[f'stop_price_{level}'])
+                log(f'Stop order level={level} stop_price={stop_price}')
                 down_order = SampleOrder.create_order_stp(
                     action='SELL',
                     percent=-100,
@@ -354,11 +366,12 @@ def main():
 
     # check risk for positions from tws
     tws_data = app.get_tws_data()
-    for ticker, tws_row in tws_data.iterrows:
+    for ticker, tws_row in tws_data.iterrows():
         app.send_request_market_data(ticker)
 
+    """
     # processing positions from DB
-    for ticker, db_row in __dbdata__.iterrows:
+    for ticker, db_row in __dbdata__.iterrows():
         if db_row['is_active']:
             if ticker not in tws_data.index:
                 # first buy
@@ -367,7 +380,7 @@ def main():
                 app.send_request_market_data(ticker)
         else:
             app.cancel_orders_for_ticker(ticker)
-
+    """
     input('Press Enter for stop')
     stop(app)
 
