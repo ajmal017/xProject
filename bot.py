@@ -1,265 +1,71 @@
-# IB API
-from ibapi.client import EClient
-from ibapi.wrapper import EWrapper
-from ibapi.common import TickerId
-from ibapi.contract import Contract
-from ibapi.order_condition import Create, OrderCondition
-from ibapi.order import Order
-from ibapi.tag_value import TagValue
 # MY
 from logger import set_logger, log
 from db_data import DBData
+from sampleorder import SampleOrder
+from ibapiobject import IBAPIWrapper, IBAPIClient
+from scaffolding import TickPrice, FILL_CODE
+
 # COMMON
 from threading import Thread, Lock
 from configparser import ConfigParser
-from string import printable
 import pandas as pd
-import numpy as np
 import time
+import datetime
+
+
+# TODO save last price for every position in DB
+# TODO create thread for every position and monitor last_price from DB
+# TODO run algorithm from thread if condition execute
+# TODO replace algorithm from execDetails and tickPrice to thread-method
 
 
 __config__ = ConfigParser()
 __dbdata__ = DBData()
 
 
-class TickPrice():
-    BID = 1
-    ASK = 2
-    LAST = 4
+def is_time_coming(db_row: pd.Series):
+    """
+        Check condition if time is coming
+    """
+    import numpy as np
+    return datetime.datetime.now() < db_row['first_price_time'] + np.timedelta64(db_row['time_to_cond2'], 's')
 
 
-class Stock:
-    Exchange = {'EN': 'SMART', 'HK': 'SEHK', 'JP': 'SMART'}
-    Money = {'EN': 'USD', 'HK': 'HKD', 'JP': 'JPY'}
-
-
-def stock_contract(symbol, sec_type='STK', stock='EN'):
-    contract = Contract()
-    contract.symbol = symbol
-    contract.secType = sec_type
-    contract.exchange = Stock.Exchange[stock]
-    contract.currency = Stock.Money[stock]
-    return contract
-
-
-def create_order(action, total_quantity, method, group_name):
-    order = Order()
-    order.action = action
-    order.totalQuantity = total_quantity
-    order.faGroup = group_name
-    order.faMethod = method
-    order.transmit = True
-    return order
-
-
-def create_order_buy(total_quantity, group_name):
-    order = create_order('BUY', total_quantity, "NetLiq", group_name)
-    order.tif = 'DAY'
-    order.outsideRth = True
-    return order
-
-
-def create_order_lmt(action, total_quantity, method, lmt_price, group_name):
-    order = create_order(action, total_quantity, method, group_name)
-    order.orderType = "LMT"
-    order.lmtPrice = lmt_price
-    return order
-
-
-def create_order_pct(action="SELL", total_quantity=0, percent="-100", tif='DAY', group_name="IPO"):
-    order = create_order(action, total_quantity, "PctChange", group_name)
-    order.orderType = "MKT"
-    order.faPercentage = percent
-    order.totalQuantity = total_quantity
-    order.tif = tif
-    return make_adaptive(order)
-
-
-def make_adaptive(order, priority="Normal"):
-    order.algoStrategy = "Adaptive"
-    order.algoParams = [TagValue("adaptivePriority", priority)]
-    return order
-
-
-class IBApp(EWrapper, EClient):
+class IBApp(IBAPIWrapper, IBAPIClient):
+    """
+        Class for running application
+    """
     def __init__(self, ip_address, ip_port, id_client):
-        EClient.__init__(self, self)
-        # init fields
-        self.is_connect = True
-        self.__tws_data__ = pd.DataFrame([], columns=['Symbol', 'Quantity', 'Average Cost'])
-        self.__acc_summary__ = pd.DataFrame([], columns=['reqId', 'Account', 'Tag', 'Value', 'Currency'])
-        self.__tws_data_agg__ = None
-        self.closed_tickers = {}
-        self.next_order_id = None
+        IBAPIWrapper.__init__(self)
+        IBAPIClient.__init__(self, wrapper=self)
+
+        # Init fields
         self.contract_details = {}
         self.reqid_ticker = {}
         self.ticker_reqid = {}
         self.lock = Lock()
+        self.closed_tickers = {}
+        self.next_order_id = None
 
-        # connect to TWS and launch client thread
+        self.init_error()
+
+        # Connect to TWS and launch client thread
         self.connect(ip_address, ip_port, id_client)
         log(f"connection to {ip_address}:{ip_port} client = {id_client}", "INFO")
         self.thread = Thread(target=self.run, daemon=True)
         self.thread.start()
+        setattr(self, "_thread", self.thread)
 
         # Check if the API is connected via next_order_id
-        while True:
-            if isinstance(self.next_order_id, int):
-                log('API connected')
-                break
-            else:
-                log('Waiting for connection...')
-                time.sleep(0.5)
-
-    def error(self, req_id, code, message):
-        if code == 202:
-            log('Order canceled', 'ERROR')
-        elif req_id > -1:
-            message = ''.join(filter(lambda x: x in set(printable), message))
-            log(f"Error. Id: {req_id}, code: {code} message: {message}", "ERROR")
-
-    def accountSummary(self, req_id, account, tag, value, currency):
-        index = str(account)
-        self.__acc_summary__.loc[index] = req_id, account, tag, value, currency
-        log(f"{req_id} {account} {value}")
-
-    def positionMulti(self, req_id, account, model_code, contract, pos, avg_cost):
-        super().positionMulti(req_id, account, model_code, contract, pos, avg_cost)
-        log(f"PositionMulti. RequestId: {req_id} Account: {account} ModelCode: {model_code} Symbol: {contract.symbol} SecType: {contract.secType} Currency: {contract.currency} Position: {pos} AvgCost: {avg_cost}")
-        if contract.secType == 'CASH':
-            log(f'Skip CASH')
-        else:
-            index = str(account) + str(contract.symbol)
-            self.__tws_data__.loc[index] = contract.symbol, pos, avg_cost
-            self.__tws_data_agg__ = None
-
-    def check_risk(self, ticker):
-        ticker_row = __dbdata__.data.loc[ticker]
-        contract = stock_contract(ticker, stock=ticker_row['stock'])
-        contract = self.get_contract_details(ticker_row['request_id'], contract)
-        self.reqid_ticker[ticker_row['request_id']] = ticker
-        self.ticker_reqid[ticker] = ticker_row['request_id']
-        self.reqMktData(ticker_row['request_id'], contract, '', False, False, [])
-
-    def tickPrice(self, req_id, tick_type, price, attrib):
-        if tick_type == TickPrice.LAST:
-
-            ticker = self.reqid_ticker[req_id]
-            log(f'The last price for {ticker} request_id = {req_id} is: {price}')
-            tws_data = self.get_tws_data()
-
-            tws_row = tws_data.loc[ticker]
-            initial_cost = tws_row['Quantity'] * tws_row['AverageCost']
-            current_cost = tws_row['Quantity'] * price
-            delta_cost = current_cost - initial_cost
-
-            db_row = __dbdata__.data.loc[ticker]
-            group_nav = self.navs()
-            risk_value = group_nav * float(db_row['risk_check'])
-            log(f'For ticker {ticker} calculated delta_cost: {delta_cost}, risk_value: {risk_value}')
-
-            self.lock.acquire()
-            try:
-                if ticker not in self.closed_tickers and (delta_cost < -1. * risk_value) and (tws_row['Quantity'] > 0):
-                    order = make_adaptive(create_order_pct(group_name=db_row['group_name']))
-                    order.orderType = "MKT"
-                    self.closed_tickers[ticker] = self.place_order(ticker=ticker, order=order, stock=db_row['stock'])
-                    log(f'Place order for close ticker {ticker}')
-            finally:
-                log(f'Released a lock {ticker}')
-                self.lock.release()
-
-    def place_order(self, ticker, order, stock):
-        contract = stock_contract(ticker, stock=stock)
-        """
-        req_id = self.next_order_id
-        self.next_order_id += 1
-        try:
-            contract = self.get_contract_details(req_id, contract)
-        except Exception as e:
-            print(contract)
-            log(f'message: {e} contract: {contract}')
-        """
-        # order_id = ib_app.nextValidId() # TODO Check nextValidID
-        order_id = self.next_order_id
-        self.next_order_id += 1
-        self.placeOrder(order_id, contract, order)
-        return order_id
-
-    def orderStatus(self, orderId, status, filled, remaining, avgFullPrice, permId, parentId, lastFillPrice, clientId, whyHeld, mktCapPrice):
-        log(f'orderStatus - orderid: {orderId} status: {status} filled: {filled} remaining: {remaining} lastFillPrice: {lastFillPrice}')
-
-    def openOrder(self, orderId, contract, order, orderState):
-        log(f'openOrder id: {orderId} {contract.symbol} {contract.secType}  @ {contract.exchange} : {order.action} {order.orderType} {order.totalQuantity} {orderState.status}')
-
-    def execDetails(self, reqId, contract, execution):
-        super().execDetails(reqId, contract, execution)
-        log(f'Order Executed: {reqId} {contract.symbol} {contract.secType} {contract.currency} {execution.execId}  {execution.orderId} {execution.shares} {execution.lastLiquidity}')
-        ticker = contract.symbol
-
-        """
-        if (__dbdata__.data.loc[ticker, 'first_order_quantity'] == execution.cumQty
-                and execution.orderId == __dbdata__.data.loc[ticker, 'first_order_id']):
-            # place order for buy if first order is filled
-            limit_price = __dbdata__.data.loc[ticker, 'first_price']
-            group_nav = self.navs()
-            total_quantity = int(
-                round(group_nav *
-                    __dbdata__.data.loc[ticker, 'allocation'] *
-                    __dbdata__.data.loc[ticker, 'v1_buy_alloc'] /
-                    limit_price, 0)
-            ) - execution.cumQty
-            #
-            order = make_adaptive(
-                create_order_lmt(
-                    action='BUY',
-                    total_quantity=total_quantity,
-                    method="NetLiq",
-                    lmt_price=limit_price)
-            )
-            order.outsideRth = False
-
-            log(f'Buy order for {ticker} totalQuantity={total_quantity} LmtPrice={limit_price}')
-            contract = stock_contract(symbol=ticker, stock=__dbdata__.data.loc[ticker, 'stock'])
-            self.placeOrder(self.next_order_id, contract, order)
-            self.next_order_id += 1
-        """
-
-    def nextValidId(self, order_id=None):
-        lock = Lock()
-        lock.acquire()
-        try:
-            if order_id is None:
-                order_id = self.next_order_id
-            super().nextValidId(order_id)
-            self.next_order_id = order_id
-            log(f"The next valid order id is: {self.next_order_id}")
-        finally:
-            lock.release()
-        return order_id
-
-    def contractDetails(self, req_id, contract_details):
-        self.contract_details[req_id] = contract_details
-
-    def get_contract_details(self, req_id, contract):
-        self.contract_details[req_id] = None
-        self.reqContractDetails(req_id, contract)
-        # Error checking loop - breaks from loop once contract details are obtained
-        for i in range(50):
-            if not self.contract_details[req_id]:
-                time.sleep(0.1)
-            else:
-                break
-        # Raise if error checking loop count maxed out (contract details not obtained)
-        if i == 49:
-            log(f'error getting contract details {req_id}', 'ERROR')
-        else:
-            self.contract_details[req_id].contract = contract
-        # Return contract details otherwise
-        return self.contract_details[req_id].contract
+        while not self.isConnected():
+            log('Waiting for connection...')
+            time.sleep(0.5)
+        log('API connected')
 
     def get_tws_data(self):
-
+        """
+            Aggregate multi positions
+        """
         def agg_positions(row):
             d = {'Quantity': row['Quantity'].sum(), 'AverageCost': row['Average Cost'].mean()}
             return pd.Series(d, index=['Quantity', 'AverageCost'])
@@ -271,10 +77,218 @@ class IBApp(EWrapper, EClient):
         return self.__tws_data_agg__.groupby(['Symbol']).apply(agg_positions)
 
     def navs(self):
+        """
+            Get account summary
+        """
         data = self.__acc_summary__
         sum_nav = data['Value'].astype('float').sum()
         log(f'Calculate NAVS = {sum_nav}')
         return sum_nav
+
+    def buy_or_sell(self, ticker, total_quantity: int):
+        """
+            Buy (or sell) total quantity for ticker as MKT, adaptive strategy
+        """
+        db_row = __dbdata__.ticker(ticker)
+
+        total_quantity = int(total_quantity)
+        order = SampleOrder.create_order_buy(
+            total_quantity=total_quantity,
+            group_name=db_row['group_name']
+        )
+        order.orderType = 'MKT'
+        order = SampleOrder.make_adaptive(order, "Normal")
+        order.outsideRth = False
+
+        if total_quantity < 0:
+            order.action = 'SELL'
+
+        log(f'{order.action} order for {ticker} totalQuantity={total_quantity}')
+
+        contract = SampleOrder.stock_contract(
+            symbol=ticker,
+            stock=db_row['stock']
+        )
+        contract = self.resolve_ib_contract(contract)
+
+        return self.place_order(contract, order)
+
+    def execDetails(self, reqId, contract, execution):
+        """
+            Fill has come back for order_id
+        """
+        super().execDetails(reqId, contract, execution)
+
+        ticker = contract.symbol
+        if ticker not in __dbdata__.data.index:
+            return
+
+        reqId = int(reqId)
+        db_row = __dbdata__.ticker(ticker)
+
+        # check if fill first order
+        if (    reqId == FILL_CODE
+                and db_row['first_order_quantity'] == execution.cumQty
+                and execution.orderId == db_row['first_order_id'] ):
+
+            group_nav = self.navs()
+            total_quantity = group_nav * db_row['allocation'] * db_row['v1_buy_alloc'] / db_row['first_price']
+            total_quantity = int(round(total_quantity, 0)) - execution.cumQty
+
+            self.buy_or_sell(
+                ticker=ticker,
+                total_quantity=total_quantity
+            )
+            self.update_levels(ticker, db_row['first_price'])
+
+        elif reqId == FILL_CODE and execution.orderRef == 'STOP':
+            __dbdata__.set_value(ticker, "is_active", 0)
+            
+        elif reqId == FILL_CODE and execution.orderRef == 'STAGE3':
+            self.update_levels(ticker, db_row['first_price'])
+
+    def tickPrice(self, req_id, tick_type, price, attrib):
+        """
+            Processing price changing
+        """
+        if tick_type == TickPrice.LAST:
+            ticker = self.reqid_ticker[req_id]
+            log(f'The last price for {ticker} request_id = {req_id} is: {price}')
+            tws_data = self.get_tws_data()
+
+            tws_row = tws_data.loc[ticker]
+            initial_cost = tws_row['Quantity'] * tws_row['AverageCost']
+            current_cost = tws_row['Quantity'] * price
+            delta_cost = current_cost - initial_cost
+
+            group_nav = self.navs()
+
+            db_row = __dbdata__.ticker(ticker)
+
+            if db_row['first_price'] == 0:
+                __dbdata__.set_value(ticker, 'first_price', price)
+                __dbdata__.set_value(ticker, 'first_price_time', datetime.datetime.now())
+                __dbdata__.set_value(ticker, 'max_price', price)
+            elif not is_time_coming(db_row):
+                if db_row['max_price'] < price:
+                    __dbdata__.set_value(ticker, 'max_price', price)
+            else:
+                if price <= 1.4 * db_row['first_price']:
+                    # second stage
+                    if price > db_row['first_price']:
+                        total_quantity = group_nav * db_row['allocation'] * db_row['v2_buy_alloc'] / price
+                        self.buy_or_sell(
+                            ticker=ticker,
+                            total_quantity=total_quantity
+                        )
+                        self.update_levels(ticker, db_row['first_price'])
+
+                    # third stage
+                    order = SampleOrder.make_adaptive(
+                        SampleOrder.create_order_stp(
+                            action='BUY',
+                            percent=0,
+                            aux_price=db_row['max_price']
+                        )
+                    )
+                    order.faMethod = "NetLiq"
+                    order.totalQuantity = group_nav*db_row['allocation']*db_row['v3_buy_alloc']/price
+                    contract = SampleOrder.stock_contract(ticker, stock=db_row['stock'])
+                    contract = self.resolve_ib_contract(contract)
+                    order.orderRef = "STAGE3"
+                    self.place_order(ibcontract=contract, order=order)
+
+            risk_value = group_nav * float(db_row['risk_check'])
+            log(f'For ticker {ticker} calculated delta_cost: {delta_cost}, risk_value: {risk_value}')
+
+            # check flags for triggers
+            for level in range(4):
+                is_active_name = f'stop_is_active_{level}'
+                trigger_stop = f'trigger_stop_up_{level+1}'
+                if db_row[is_active_name] and price > db_row['first_price'] * (1 + db_row[trigger_stop]):
+                    __dbdata__.set_value(ticker, is_active_name, 0)
+
+            # is risk exceed?
+            if delta_cost > -1. * risk_value: # TODO correct comparasion -> delta_cost < -1. * risk_value
+                self.lock.acquire()
+                try:
+                    if ticker not in self.closed_tickers:
+                        order = SampleOrder.create_order_pct(group_name=db_row['group_name'])
+                        contract = SampleOrder.stock_contract(ticker, stock=db_row['stock'])
+                        contract = self.resolve_ib_contract(contract)
+                        self.closed_tickers[ticker] = self.place_order(contract, order)
+                        log(f'Place order for close ticker {ticker}')
+                finally:
+                    log(f'Released a lock {ticker}')
+                    self.lock.release()
+            else:
+                self.update_levels(ticker, db_row['first_price'])
+
+    def send_request_market_data(self, ticker):
+        ticker_row = __dbdata__.ticker(ticker)
+        contract = SampleOrder.stock_contract(ticker, stock=ticker_row['stock'])
+        contract = self.resolve_ib_contract(contract)
+        req_id = ticker_row['request_id']
+        self.reqid_ticker[req_id] = ticker
+        self.ticker_reqid[ticker] = req_id
+        self.reqMktData(req_id, contract, '', False, False, [])
+
+    def initial_buy(self, ticker):
+        db_row = __dbdata__.ticker(ticker)
+        contract = SampleOrder.stock_contract(ticker, stock=db_row['stock'])
+        contract = self.resolve_ib_contract(contract)
+        group_nav = self.navs()
+
+        lmt_price = round(float(db_row['book_price'] * 2), 2)
+        order = SampleOrder.create_order_buy(
+            total_quantity=int(group_nav * db_row['allocation'] * db_row['v1_buy_alloc'] / lmt_price),
+            lmt_price=lmt_price,
+            group_name=db_row['group_name']
+        )
+        order_id = self.place_order(contract, order)
+        if order_id is not None:
+            __dbdata__.set_value(ticker, 'first_order_id', order_id)
+
+    def cancel_orders_for_ticker(self, ticker):
+        open_orders = self.get_open_orders()
+        for order_id in open_orders:
+            if open_orders[order_id].contract.symbol == ticker:
+                self.cancel_order(order_id)
+
+    def update_levels(self, ticker, first_price: float):
+        # request all open orders for current client id
+        self.cancel_orders_for_ticker(ticker)
+
+        db_row = __dbdata__.ticker(ticker)
+
+        # set new orders
+        # UP
+        contract = SampleOrder.stock_contract(ticker, stock=db_row['stock'])
+        contract = self.resolve_ib_contract(contract)
+        for level in range(1, 5):
+            if db_row['level_is_active_%d' % level]:
+                lmt_price = round(first_price * (1 + float(db_row['trigger_profit_up%d' % level])), 2)
+                up_order = SampleOrder.create_order_lmt(
+                    action='SELL',
+                    percent=-100*db_row['v_trig_up%d' % level],
+                    lmt_price=lmt_price,
+                    group_name=db_row['group_name']
+                )
+                self.place_order(ibcontract=contract, order=up_order)
+        # DOWN
+        for level in range(5):
+            if db_row[f'stop_is_active_{level}']:
+                stop_price = first_price * (1.0 + db_row[f'stop_price_{level}'])
+                log(f'Stop order level={level} stop_price={stop_price}')
+                down_order = SampleOrder.create_order_stp(
+                    action='SELL',
+                    percent=-100,
+                    aux_price=stop_price,
+                    group_name=db_row['group_name']
+                )
+                down_order.orderRef = 'STOP'
+                self.place_order(ibcontract=contract, order=down_order)
+                break
 
 
 def start():
@@ -294,56 +308,80 @@ def start():
     return app
 
 
-def save_csv():
+def save_db():
     __dbdata__.csv_save()
+    log("DB saved")
 
 
-def load_csv():
+def load_db():
     __dbdata__.csv_load(
         path=__config__['db_csv']['path'],
         index=__config__['db_csv']['index']
     )
 
 
+def update_db(timeout=5):
+    """
+        Auto check if db-object was changed and run save method by timeout
+    """
+
+    def check_for_save():
+        while True:
+            time.sleep(timeout)
+            if __dbdata__.is_changed:
+                __dbdata__.is_changed = False
+                save_db()
+
+    thread = Thread(target=check_for_save, daemon=True)
+    thread.start()
+
+
 def stop(app):
     try:
         app.disconnect()
         log('Disconnect', 'INFO')
+        time.sleep(2 * int(__config__['db_csv']['timeout']))
     except Exception as e:
         log(f'Getting error while disconnecting: {e}')
 
 
 def init():
+    """
+        Activate object for working: __config__, __db_data__
+    """
     __config__.read('config.ini')
     set_logger(
         'xProject.log',
         mode=__config__['logger']['mode'],
         level=__config__['logger']['level']
     )
-    load_csv()
+    load_db()
+    update_db(int(__config__['db_csv']['timeout']))
 
 
 def main():
     init()
+    # start IB application
     app = start()
-    """
-    place_order(
-        ib_app=app,
-        action='BUY',
-        total_quantity=1000,
-        order_type='MKT',
-        limit_price=0,
-        ticker="SPY"
-    )
-    """
 
+    # check risk for positions from tws
     tws_data = app.get_tws_data()
-    for ticker, row in tws_data.iterrows():
-        app.check_risk(ticker)
+    for ticker, tws_row in tws_data.iterrows():
+        app.send_request_market_data(ticker)
 
-
-    while True:
-        pass
+    """
+    # processing positions from DB
+    for ticker, db_row in __dbdata__.iterrows():
+        if db_row['is_active']:
+            if ticker not in tws_data.index:
+                # first buy
+                app.initial_buy(ticker)
+                # set handle
+                app.send_request_market_data(ticker)
+        else:
+            app.cancel_orders_for_ticker(ticker)
+    """
+    input('Press Enter for stop')
     stop(app)
 
 
